@@ -2,6 +2,7 @@ import torch
 
 from nerf.provider import NeRFDataset, RayDataset
 from nerf.utils import *
+from nerfstudio.model_components.losses import MSELoss
 
 import argparse
 
@@ -18,7 +19,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_rays', type=int, default=4096)
     parser.add_argument('--num_steps', type=int, default=64)
     parser.add_argument('--downscale', type=int, default=1)
-    parser.add_argument('--upsample_steps', type=int, default=64)
+    parser.add_argument('--upsample_steps', type=int, default=0)
     parser.add_argument('--max_ray_batch', type=int, default=4096)
     
     #Network Settings
@@ -77,7 +78,8 @@ if __name__ == '__main__':
     if opt.network in ['tcnn', 'enc', 'sdf', 'phasor']:
         optimizer = lambda model: torch.optim.Adam([
         {'name': 'encoding', 'params': list(model.encoder.parameters())},
-        {'name': 'net', 'params': list(model.sdf_net.parameters()) + list(model.color_net.parameters())+ list(model.deviation_net.parameters()), 'weight_decay': 1e-6},
+        # {'name': 'net', 'params': list(model.sdf_net.parameters()) + list(model.color_net.parameters())+ list(model.deviation_net.parameters()), 'weight_decay': 1e-6},
+        {'name': 'net', 'params': list(model.sdf_net.parameters()) + list(model.color_net.parameters())+ list(model.deviation_net.parameters())},
     ], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
 
     else:
@@ -87,10 +89,12 @@ if __name__ == '__main__':
         ], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
 
     #scheduler = lambda optimizer: optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 100, 150], gamma=0.33)
-    scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / 20000, 1))
+    # scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / 20000, 1))
+    scheduler = None
 
     #criterion = torch.nn.SmoothL1Loss()
-    criterion = torch.nn.HuberLoss()
+    # criterion = torch.nn.HuberLoss()
+    criterion = MSELoss()
 
     trainer = Trainer('ngp', 
                 vars(opt), 
@@ -108,16 +112,17 @@ if __name__ == '__main__':
 
     if opt.mode == 'train':
         train_dataset = NeRFDataset(opt.path, type='train', mode=opt.format, bound=opt.bound)
-        valid_dataset = NeRFDataset(opt.path, type='valid', mode=opt.format, downscale=opt.downscale, bound=opt.bound)
+        valid_dataset = NeRFDataset(opt.path, type='val', mode=opt.format, downscale=opt.downscale, bound=opt.bound)
 
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
         valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1)
 
-        trainer.train(train_loader, valid_loader, 200)
+        trainer.train(train_loader, valid_loader, 50)
 
     elif opt.mode == 'mesh':
-        valid_dataset = NeRFDataset(opt.path, type='valid', mode=opt.format, downscale=opt.downscale, bound=opt.bound)
-        trainer.save_mesh(aabb = valid_dataset.aabb, resolution= 512, threshold=0.0, use_sdf=(opt.network=='sdf'))
+        save_path = os.path.join(opt.workspace, 'meshes', f'{opt.workspace.split("/")[-1]}.obj')
+        valid_dataset = NeRFDataset(opt.path, type='val', mode=opt.format, downscale=opt.downscale, bound=opt.bound)
+        trainer.save_mesh(save_path = save_path, aabb = valid_dataset.aabb, resolution= 512, threshold=0.0, use_sdf=(opt.network=='sdf'))
 
     elif opt.mode == 'render':
         test_dataset = NeRFDataset(opt.path, type='test', mode=opt.format, downscale=opt.downscale, bound=opt.bound)

@@ -1,12 +1,23 @@
 import time
 import mcubes
 import trimesh
+import nerfacc
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import raymarching
+# import raymarching
+
+from nerfstudio.cameras.rays import RayBundle
+from nerfstudio.model_components.ray_samplers import VolumetricSampler
+from nerfstudio.model_components.renderers import (
+    AccumulationRenderer,
+    DepthRenderer,
+    RGBRenderer,
+)
+from nerfstudio.utils import colors
+from nerfstudio.data.scene_box import SceneBox
 
 def sample_pdf(bins, weights, n_samples, det=False):
     # This implementation is from NeRF
@@ -98,6 +109,14 @@ class NeRFRenderer(nn.Module):
             self.register_buffer('step_counter', step_counter)
             self.mean_count = 0
             self.local_step = 0
+
+        vol_sampler_aabb = SceneBox(torch.stack((torch.tensor([-1.0, -1.0, -1.0]), torch.tensor([1.0, 1.0, 1.0])))).aabb
+        self.sampler = VolumetricSampler(
+            scene_aabb=vol_sampler_aabb
+        )
+        self.renderer_rgb = RGBRenderer(background_color=colors.WHITE)
+        self.renderer_normal = RGBRenderer(background_color=colors.BLACK)
+        self.renderer_depth = DepthRenderer(method="expected")
     
     def forward(self, x, d, bound):
         raise NotImplementedError()
@@ -134,107 +153,231 @@ class NeRFRenderer(nn.Module):
         # sample steps
         near, far = near_far_from_bound(rays_o, rays_d, bound, type='cube')
      
-        z_vals = torch.linspace(0.0, 1.0, num_steps, device=device).unsqueeze(0)# [1, T]
-        z_vals = z_vals.expand((N, num_steps)) # [N, T]
-        z_vals = near + (far - near) * z_vals # [N, T], in [near, far]
+        use_old = False
+        if use_old:
+            z_vals = torch.linspace(0.0, 1.0, num_steps, device=device).unsqueeze(0)# [1, T]
+            z_vals = z_vals.expand((N, num_steps)) # [N, T]
+            z_vals = near + (far - near) * z_vals # [N, T], in [near, far]
 
-        # perturb z_vals
-        sample_dist = (far - near) / num_steps
-        if self.training:
-            z_vals = z_vals + (torch.rand(z_vals.shape, device=device) - 0.5) * sample_dist
+            # perturb z_vals
+            sample_dist = (far - near) / num_steps
+            if self.training:
+                z_vals = z_vals + (torch.rand(z_vals.shape, device=device) - 0.5) * sample_dist
 
-        # generate pts
-        pts = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * z_vals.unsqueeze(-1) # [N, 1, 3] * [N, T, 3] -> [N, T, 3]
-        pts = pts.clamp(-bound, bound) # must be strictly inside the bounds, else lead to nan in hashgrid encoder!
+            # generate pts
+            pts = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * z_vals.unsqueeze(-1) # [N, 1, 3] * [N, T, 3] -> [N, T, 3]
+            pts = pts.clamp(-bound, bound) # must be strictly inside the bounds, else lead to nan in hashgrid encoder!
 
-        if upsample_steps > 0:
-            with torch.no_grad():
-                # query SDF and RGB
-                sdf_nn_output = self.forward_sdf(pts.reshape(-1, 3), bound)
-                sdf = sdf_nn_output[:, :1]
-                sdf = sdf.reshape(N, num_steps) # [N, T]
-                
-                for i in range(upsample_steps // 16):
-                    new_z_vals = self.up_sample(rays_o, rays_d, z_vals, sdf, 16, 64 * 2 **i)
-                    z_vals, sdf = self.cat_z_vals(rays_o, rays_d, z_vals, new_z_vals, sdf, bound, last=(i + 1 == upsample_steps // 16))
+            if upsample_steps > 0:
+                with torch.no_grad():
+                    # query SDF and RGB
+                    sdf_nn_output = self.forward_sdf(pts.reshape(-1, 3), bound)
+                    sdf = sdf_nn_output[:, :1]
+                    sdf = sdf.reshape(N, num_steps) # [N, T]
                     
+                    for i in range(upsample_steps // 16):
+                        new_z_vals = self.up_sample(rays_o, rays_d, z_vals, sdf, 16, 64 * 2 **i)
+                        z_vals, sdf = self.cat_z_vals(rays_o, rays_d, z_vals, new_z_vals, sdf, bound, last=(i + 1 == upsample_steps // 16))
+                        
 
-            num_steps += upsample_steps
+                num_steps += upsample_steps
 
-        ### render core
-        deltas = z_vals[:, 1:] - z_vals[:, :-1] # [N, T-1]
-        deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[:, :1])], dim=-1)
+            ### render core
+            deltas = z_vals[:, 1:] - z_vals[:, :-1] # [N, T-1]
+            deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[:, :1])], dim=-1)
 
-        # sample pts on new z_vals
-        z_vals_mid = (z_vals[:, :-1] + 0.5 * deltas[:, :-1]) # [N, T-1]
-        z_vals_mid = torch.cat([z_vals_mid, z_vals[:,-1:]], dim=-1)
+            # sample pts on new z_vals
+            z_vals_mid = (z_vals[:, :-1] + 0.5 * deltas[:, :-1]) # [N, T-1]
+            z_vals_mid = torch.cat([z_vals_mid, z_vals[:,-1:]], dim=-1)
 
-        new_pts = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * z_vals_mid.unsqueeze(-1) # [N, 1, 3] * [N, t, 3] -> [N, t, 3]
-        new_pts = new_pts.clamp(-bound, bound)
- 
-        # only forward new points to save computation
-        new_dirs = rays_d.unsqueeze(-2).expand_as(new_pts)
+            new_pts = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * z_vals_mid.unsqueeze(-1) # [N, 1, 3] * [N, t, 3] -> [N, t, 3]
+            new_pts = new_pts.clamp(-bound, bound)
+    
+            # only forward new points to save computation
+            new_dirs = rays_d.unsqueeze(-2).expand_as(new_pts)
 
-        sdf_nn_output = self.forward_sdf(new_pts.reshape(-1, 3), bound)
+
+        else:
+            ####################
+            # import ipdb;ipdb.set_trace()
+            # rays_o = torch.load('rays_o.pt')
+            # rays_d = torch.load('rays_d.pt')
+            rays = RayBundle(
+                origins=rays_o,
+                directions=rays_d,
+                pixel_area=None,
+                camera_indices=None,
+                times=None,
+            )
+            with torch.no_grad():
+                ray_samples, packed_info, ray_indices, deltas, new_dirs = self.sampler(
+                    ray_bundle=rays,
+                    # near_plane=near.squeeze(),
+                    # far_plane=far.squeeze(),
+                    render_step_size=0.01,
+                    cone_angle=0.004,
+                    return_dist=True,
+                )
+                # ray_samples = torch.load('ray_samples.pt')
+                # packed_info = torch.load('packed_info.pt')
+                # ray_indices = torch.load('ray_indices.pt')
+                # deltas = torch.load('deltas.pt')
+                # new_dirs = torch.load('new_dirs.pt')
+
+            new_pts = ray_samples.frustums.get_positions()
+            new_pts.requires_grad = True
+            # new_dirs = rays_d[ray_indices]
+            z_vals = ray_samples.frustums.starts
+        ######################
+
+
+        sdf_nn_output, new_pts = self.forward_sdf(new_pts.reshape(-1, 3), self.sampler.scene_aabb.reshape(2, 3))
         sdf = sdf_nn_output[:, :1]
         feature_vector = sdf_nn_output[:, 1:]
 
-        gradient = self.gradient(new_pts.reshape(-1, 3), bound, 0.005 * (1.0 - normal_epsilon_ratio)).squeeze()
-        normal =  gradient / (1e-5 + torch.linalg.norm(gradient, ord=2, dim=-1,  keepdim = True))
-
-        color = self.forward_color(new_pts.reshape(-1, 3), new_dirs.reshape(-1, 3), normal.reshape(-1, 3), feature_vector, bound)
-
-        inv_s = self.forward_variance()     # Single parameter
-        inv_s = inv_s.expand(N * num_steps, 1)
-
-        true_cos = (new_dirs.reshape(-1, 3) * normal).sum(-1, keepdim=True)
-    
-        # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
-        # the cos value "not dead" at the beginning training iterations, for better convergence.
-        # version relu
-        # iter_cos = -(F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
-        #             F.relu(-true_cos) * cos_anneal_ratio)  # always non-positive
         
-        # version Softplus
-        activation = nn.Softplus(beta=100)
-        iter_cos = -(activation(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
-                    activation(-true_cos) * cos_anneal_ratio)  # always non-positive
 
-        # Estimate signed distances at section points
-        estimated_next_sdf = sdf + iter_cos * deltas.reshape(-1, 1) * 0.5
-        estimated_prev_sdf = sdf - iter_cos * deltas.reshape(-1, 1) * 0.5
+        if use_old:
+            gradient = self.gradient(new_pts.reshape(-1, 3), bound, 0.005 * (1.0 - normal_epsilon_ratio)).squeeze()
+            normal =  gradient / (1e-5 + torch.linalg.norm(gradient, ord=2, dim=-1,  keepdim = True))
 
-        prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
-        next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+            color = self.forward_color(new_pts.reshape(-1, 3), new_dirs.reshape(-1, 3), normal.reshape(-1, 3), feature_vector, bound)
 
-        # Equation 13 in NeuS
-        alpha = ((prev_cdf - next_cdf + 1e-5) / (prev_cdf + 1e-5)).reshape(N, num_steps).clip(0.0, 1.0)
+            inv_s = self.forward_variance()     # Single parameter
+            inv_s = inv_s.expand(new_pts.reshape(-1, 3).shape[0], 1)
 
-        weights = alpha * torch.cumprod(torch.cat([torch.ones([N, 1],device=alpha.device), 1. - alpha + 1e-7], -1), -1)[:, :-1]
-
-        weights_sum = weights.sum(dim=-1, keepdim=True)
-        # calculate color 
-        color = color.reshape(N, num_steps, 3) # [N, T, 3]
-        image = (color * weights[:, :, None]).sum(dim=1)
-
-        # calculate normal 
-        normal_map = normal.reshape(N, num_steps, 3) # [N, T, 3]
-        normal_map = torch.sum(normal_map * weights[:, :, None], dim=1)
+            true_cos = (new_dirs.reshape(-1, 3) * normal).sum(-1, keepdim=True)
         
-        # calculate depth 
-        ori_z_vals = ((z_vals - near) / (far - near)).clamp(0, 1)
-        depth = torch.sum(weights * ori_z_vals, dim=-1)
+            # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
+            # the cos value "not dead" at the beginning training iterations, for better convergence.
+            # version relu
+            # iter_cos = -(F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
+            #             F.relu(-true_cos) * cos_anneal_ratio)  # always non-positive
+            
+            # version Softplus
+            activation = nn.Softplus(beta=100)
+            # activation = F.relu
+            iter_cos = -(activation(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
+                        activation(-true_cos) * cos_anneal_ratio)  # always non-positive
 
-        # TODO:Eikonal loss 
-        pts_norm = torch.linalg.norm(new_pts.reshape(-1, 3), ord=2, dim=-1, keepdim=True).reshape(N, num_steps)
-        inside_sphere = (pts_norm < 1.0).float().detach()
-        relax_inside_sphere = (pts_norm < 1.2).float().detach()
+            # Estimate signed distances at section points
+            estimated_next_sdf = sdf + iter_cos * deltas.reshape(-1, 1) * 0.5
+            estimated_prev_sdf = sdf - iter_cos * deltas.reshape(-1, 1) * 0.5
 
-        gradient_error = (torch.linalg.norm(gradient.reshape(N, num_steps, 3), ord=2,
-                                            dim=-1) - 1.0) ** 2
-        gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
+            prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+            next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
 
-        assert (gradient == gradient).all(), 'Nan or Inf found!'
+            # Equation 13 in NeuS
+            alpha = ((prev_cdf - next_cdf + 1e-5) / (prev_cdf + 1e-5)).reshape(N, num_steps).clip(0.0, 1.0)
+
+            weights = alpha * torch.cumprod(torch.cat([torch.ones([N, 1],device=alpha.device), 1. - alpha + 1e-7], -1), -1)[:, :-1]
+
+            weights_sum = weights.sum(dim=-1, keepdim=True)
+            # calculate color 
+            color = color.reshape(N, num_steps, 3) # [N, T, 3]
+            image = (color * weights[:, :, None]).sum(dim=1)
+            
+            # calculate normal 
+            normal_map = normal.reshape(N, num_steps, 3) # [N, T, 3]
+            normal_map = torch.sum(normal_map * weights[:, :, None], dim=1)
+            
+            # calculate depth 
+            ori_z_vals = ((z_vals - near) / (far - near)).clamp(0, 1)
+            depth = torch.sum(weights * ori_z_vals, dim=-1)
+
+            # TODO:Eikonal loss 
+            pts_norm = torch.linalg.norm(new_pts.reshape(-1, 3), ord=2, dim=-1, keepdim=True).reshape(N, num_steps)
+            inside_sphere = (pts_norm < 1.0).float().detach()
+            relax_inside_sphere = (pts_norm < 1.2).float().detach()
+
+            gradient_error = (torch.linalg.norm(gradient.reshape(N, num_steps, 3), ord=2,
+                                                dim=-1) - 1.0) ** 2
+            gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
+
+            assert (gradient == gradient).all(), 'Nan or Inf found!'
+
+            # mix background color
+            if bg_color is None:
+                bg_color = 1
+        
+            image = image + (1 - weights_sum) * bg_color
+        else:
+            gradient = self.gradient(new_pts.reshape(-1, 3), bound, 0.005 * (1.0 - normal_epsilon_ratio)).squeeze()
+            normal =  gradient / (1e-5 + torch.linalg.norm(gradient, ord=2, dim=-1,  keepdim = True))
+            # gradient = torch.autograd.grad(
+            #     sdf,
+            #     new_pts,
+            #     grad_outputs=torch.ones_like(sdf),
+            #     retain_graph=True,
+            # )[0]
+            # normal = -torch.nn.functional.normalize(gradient, dim=-1)
+            # print(gradient.mean(), gradient2.mean(), normal.mean(), normal2.mean())
+            # print(gradient.min(), gradient2.min())
+
+            color = self.forward_color(new_pts.reshape(-1, 3), new_dirs.reshape(-1, 3), normal.reshape(-1, 3), feature_vector, bound)
+
+            inv_s = self.forward_variance()     # Single parameter
+            inv_s = inv_s.expand(sdf.shape[0], 1)
+
+            true_cos = (new_dirs * normal).sum(-1, keepdim=True)
+
+            # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
+            # the cos value "not dead" at the beginning training iterations, for better convergence.
+            iter_cos = -(
+                F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) + F.relu(-true_cos) * cos_anneal_ratio
+            )  # always non-positive
+
+            # Estimate signed distances at section points
+            estimated_next_sdf = sdf + iter_cos * deltas.reshape(-1, 1) * 0.5
+            estimated_prev_sdf = sdf - iter_cos * deltas.reshape(-1, 1) * 0.5
+
+            prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+            next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+
+            p = prev_cdf - next_cdf
+            c = prev_cdf
+
+            alpha = ((p + 1e-5) / (c + 1e-5)).view(-1).clip(0.0, 1.0)
+            weights = nerfacc.render_weight_from_alpha(
+                packed_info=packed_info,
+                alphas=alpha.unsqueeze(1),
+            )
+
+            image = self.renderer_rgb(
+                rgb=color,
+                weights=weights,
+                ray_indices=ray_indices,
+                num_rays=len(rays),
+            )
+
+            normal_map = self.renderer_normal(
+                rgb=normal,
+                weights=weights,
+                ray_indices=ray_indices,
+                num_rays=len(rays),
+            )
+
+            depth = self.renderer_depth(
+                weights=weights,
+                ray_samples=ray_samples.reshape((-1)),
+                ray_indices=ray_indices,
+                num_rays=len(rays)
+            ).squeeze()
+
+            gradient_error = ((torch.linalg.norm(gradient, ord=2, dim=-1) - 1.)**2).mean()
+            # pts_norm = torch.linalg.norm(new_pts, ord=2, dim=-1, keepdim=True)
+            # inside_sphere = (pts_norm < 1.0).float().detach()
+            # relax_inside_sphere = (pts_norm < 1.2).float().detach()
+
+            # gradient_error = (torch.linalg.norm(gradient, ord=2,
+            #                                     dim=-1) - 1.0) ** 2
+            # gradient_error = (relax_inside_sphere.squeeze(-1) * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
+
+            # assert (gradient == gradient).all(), 'Nan or Inf found!'
+
+
+            assert (gradient == gradient).all(), 'Nan or Inf found!'
+
 
         if self.curvature_loss:
             # TODO:curvature loss 
@@ -250,16 +393,14 @@ class NeRFRenderer(nn.Module):
         else:
             curvature_error = 0.0
 
-        # mix background color
-        if bg_color is None:
-            bg_color = 1
-    
-        image = image + (1 - weights_sum) * bg_color
+        
         
         depth = depth.reshape(B, N)
         image = image.reshape(B, N, 3)
 
-        return depth, image, normal_map, gradient_error, curvature_error
+        loss_sparsity = torch.exp(-1 * sdf.abs()).mean()
+
+        return depth, image, normal_map, gradient_error, curvature_error, loss_sparsity
 
     def run_cuda(self, rays_o, rays_d, num_steps, bound, upsample_steps, bg_color, cos_anneal_ratio, normal_epsilon_ratio):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
@@ -496,13 +637,14 @@ class NeRFRenderer(nn.Module):
 
             gradient_error = 0.0
             curvature_error = 0.0 
+            loss_sparsity = 0.0
 
             for b in range(B):
                 head = 0
                 while head < N:
                     tail = min(head + max_ray_batch, N)
 
-                    depth_, image_, normal_, gradient_error_, curvature_error_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], num_steps, bound, upsample_steps, bg_color, 
+                    depth_, image_, normal_, gradient_error_, curvature_error_, loss_sparsity_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], num_steps, bound, upsample_steps, bg_color, 
                                                                 cos_anneal_ratio = cos_anneal_ratio, normal_epsilon_ratio = normal_epsilon_ratio)
       
                     depth[b:b+1, head:tail] = depth_.detach()
@@ -511,9 +653,9 @@ class NeRFRenderer(nn.Module):
                     gradient_error_ = gradient_error_.detach()
                     head += max_ray_batch
 
-                    del depth_, image_, normal_, gradient_error_, curvature_error_
+                    del depth_, image_, normal_, gradient_error_, curvature_error_, loss_sparsity_
         else:
-            depth, image, normal, gradient_error, curvature_error = _run(rays_o, rays_d, num_steps, bound, upsample_steps, bg_color, cos_anneal_ratio, normal_epsilon_ratio)
+            depth, image, normal, gradient_error, curvature_error, loss_sparsity = _run(rays_o, rays_d, num_steps, bound, upsample_steps, bg_color, cos_anneal_ratio, normal_epsilon_ratio)
 
         results = {}
         results['depth'] = depth
@@ -521,6 +663,7 @@ class NeRFRenderer(nn.Module):
         results['normal'] = normal
         results['gradient_error'] = gradient_error
         results['curvature_error'] = curvature_error
+        results['loss_sparsity'] = loss_sparsity
         
         return results
 

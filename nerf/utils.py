@@ -20,11 +20,13 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
+from torchmetrics import PeakSignalNoiseRatio
 
 import trimesh
 import mcubes
 from rich.console import Console
 from torch_ema import ExponentialMovingAverage
+from nerfstudio.data.scene_box import SceneBox
 
 def seed_everything(seed):
     random.seed(seed)
@@ -89,9 +91,55 @@ def get_rays(c2w, intrinsics, H, W, N_rays=-1):
 
     return rays_o, rays_d, select_inds
 
+# def get_rays(c2w, K, H, W, N_rays=-1):
+#     K = K[0]
+#     c2w = c2w[0]
+#     device = c2w.device
+#     i, j = torch.meshgrid(
+#         torch.linspace(0, W-1, W, device=c2w.device),
+#         torch.linspace(0, H-1, H, device=c2w.device))  # pytorch's meshgrid has indexing='ij'
+#     i = i.t().float()
+#     j = j.t().float()
+#     # if mode == 'lefttop':
+#     #     pass
+#     # elif mode == 'center':
+#     #     i, j = i+0.5, j+0.5
+#     # elif mode == 'random':
+#     #     i = i+torch.rand_like(i)
+#     #     j = j+torch.rand_like(j)
+#     # else:
+#     #     raise NotImplementedError
+
+#     # if flip_x:
+#     #     i = i.flip((1,))
+#     # if flip_y:
+#     #     j = j.flip((0,))
+
+#     dirs = torch.stack([(i-K[0][2])/K[0][0], (j-K[1][2])/K[1][1], torch.ones_like(i)], -1)
+   
+#     # Rotate ray directions from camera frame to the world frame
+#     rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+
+#     # Translate camera frame's origin to the world frame. It is the origin of all rays.
+#     rays_o = c2w[:3,3].expand(rays_d.shape)
+
+#     if N_rays > 0:
+#         N_rays = min(N_rays, H*W)
+#         select_hs = torch.randint(0, H, size=[N_rays], device=device)
+#         select_ws = torch.randint(0, W, size=[N_rays], device=device)
+#         select_inds = select_hs * W + select_ws
+#         select_inds = select_inds.expand([1, N_rays])
+#         rays_o = rays_o[select_hs, select_ws].unsqueeze(0)
+#         rays_d = rays_d[select_hs, select_ws].unsqueeze(0)
+#     else:
+#         select_inds = torch.arange(H*W, device=device).expand([1, H*W])
+#         rays_o = rays_o.reshape((1, H*W, 3))
+#         rays_d = rays_d.reshape((1, H*W, 3))
+
+#     return rays_o, rays_d, select_inds
 
 def extract_fields(bound_min, bound_max, resolution, query_func):
-    N = 256
+    N = 64
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(N)
     Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(N)
     Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(N)
@@ -150,7 +198,7 @@ class Trainer(object):
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
-                 white_background = False,
+                 white_background = True,
                  ):
         
         self.name = name
@@ -173,6 +221,8 @@ class Trainer(object):
         self.white_background = white_background
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
+
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
         model.to(self.device)
 
@@ -303,10 +353,16 @@ class Trainer(object):
         except:
             curvature_loss = 0.0
         
+        # gt_rgb = torch.load('gt_rgb.pt')
+        loss_sparsity = outputs['loss_sparsity']
+        loss_rgb_l1 = F.l1_loss(pred_rgb, gt_rgb)
         #loss = self.criterion(pred_rgb, gt_rgb) + 0.1 * eikonal_loss
         loss = self.criterion(pred_rgb, gt_rgb) + 0.1 * eikonal_loss + 0.1 * curvature_loss
+        # loss = 10.0 * self.criterion(pred_rgb, gt_rgb) + 0.1 * eikonal_loss
+        # loss = 10.0 * self.criterion(pred_rgb, gt_rgb) + 0.1 * eikonal_loss + 0.01 * loss_sparsity + loss_rgb_l1
+        psnr = self.psnr(pred_rgb, gt_rgb)
 
-        return pred_rgb, gt_rgb, loss
+        return pred_rgb, gt_rgb, loss, psnr
 
     def eval_step(self, data):
         images = data["image"] # [B, H, W, 3/4]
@@ -340,8 +396,9 @@ class Trainer(object):
         pred_depth = outputs['depth'].reshape(B, H, W)
 
         loss = self.criterion(pred_rgb, gt_rgb)
+        psnr = self.psnr(pred_rgb, gt_rgb)
 
-        return pred_rgb, pred_normal, pred_depth, gt_rgb, loss
+        return pred_rgb, pred_normal, pred_depth, gt_rgb, loss, psnr
 
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):  
@@ -392,22 +449,24 @@ class Trainer(object):
                     sdfs = self.model.density(pts.to(self.device), bound)
             return sdfs
         
-        scale = max(0.000001,
-                    max(max(abs(float(aabb[1][0])-float(aabb[0][0])),
-                            abs(float(aabb[1][1])-float(aabb[0][1]))),
-                            abs(float(aabb[1][2])-float(aabb[0][2]))))
+        # scale = max(0.000001,
+        #             max(max(abs(float(aabb[1][0])-float(aabb[0][0])),
+        #                     abs(float(aabb[1][1])-float(aabb[0][1]))),
+        #                     abs(float(aabb[1][2])-float(aabb[0][2]))))
                         
-        scale = 2.0 * bound / scale
+        # scale = 2.0 * bound / scale
 
-        offset =  torch.FloatTensor([
-                    ((float(aabb[1][0]) + float(aabb[0][0])) * 0.5) * -scale,
-                    ((float(aabb[1][1]) + float(aabb[0][1])) * 0.5) * -scale, 
-                    ((float(aabb[1][2]) + float(aabb[0][2])) * 0.5) * -scale])
+        # offset =  torch.FloatTensor([
+        #             ((float(aabb[1][0]) + float(aabb[0][0])) * 0.5) * -scale,
+        #             ((float(aabb[1][1]) + float(aabb[0][1])) * 0.5) * -scale, 
+        #             ((float(aabb[1][2]) + float(aabb[0][2])) * 0.5) * -scale])
 
 
         #demo setting w/o aabb
-        bounds_min = torch.FloatTensor([-0.4 * bound, -0.8 *bound, -0.3 *bound])
-        bounds_max = torch.FloatTensor([0.4 *bound, 0.4 * bound, 0.3 *bound])
+        # bounds_min = torch.FloatTensor([-0.4 * bound, -0.8 *bound, -0.3 *bound])
+        # bounds_max = torch.FloatTensor([0.4 *bound, 0.4 * bound, 0.3 *bound])
+        bounds_min = torch.FloatTensor([-1 * bound, -1 *bound, -1 *bound])
+        bounds_max = torch.FloatTensor([1 *bound, 1 * bound, 1 *bound])
         
         #ficus setting w/o aabb
         # bounds_min = torch.FloatTensor([-0.35 * bound, -1.0 *bound, -0.35 *bound])
@@ -421,8 +480,10 @@ class Trainer(object):
         
         # align camera
         vertices = np.concatenate([vertices[:,2:3], vertices[:,0:1], vertices[:,1:2]], axis=-1)
-        vertices = (vertices - offset.numpy()) / scale
-  
+        # vertices = (vertices - offset.numpy()) / scale
+        vertices = (vertices)
+
+        print(vertices.shape)
         mesh = trimesh.Trimesh(vertices, triangles, process=False) # important, process=True leads to seg fault...
         mesh.export(save_path)
 
@@ -442,7 +503,7 @@ class Trainer(object):
                 self.evaluate_one_epoch(valid_loader)
                 self.save_checkpoint(full=False, best=True)
 
-            if self.epoch % 50 == 0:
+            if self.epoch % 10 == 0:
                 if self.workspace is not None and self.local_rank == 0:
                         self.save_checkpoint(full=True, best=False)
 
@@ -469,19 +530,36 @@ class Trainer(object):
         for i, data in enumerate(loader):
             
             data = self.prepare_data(data)
+            images = data["image"] # [B, H, W, 3/4]
+            B, H, W, C = images.shape
 
+            if self.white_background:
+                bg_color = torch.ones(3, device=images.device) # [3], fixed white background
+            else:
+                # bg_color = torch.zeros(3, device=images.device) # [3], fixed black background.
+                bg_color = torch.rand(3, device=images.device) # [3], frame-wise random.
+
+            if C == 4:
+                gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
+            else:
+                gt_rgb = images
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, preds_normal, preds_depth = self.test_step(data)                
+                preds, preds_normal, preds_depth = self.test_step(data)   
             
             path = os.path.join(save_path, f'{i:04d}.png')
             path_normal = os.path.join(save_path, f'{i:04d}_normal.png')
             path_depth = os.path.join(save_path, f'{i:04d}_depth.png')
+            psnr = self.psnr(preds, gt_rgb)
 
-            self.log(f"[INFO] saving test image to {path}")
+            self.log(f"[INFO] saving test image to {path}, psnr: {psnr}")
 
             cv2.imwrite(path, cv2.cvtColor((preds[0].detach().cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
             cv2.imwrite(path_normal, cv2.cvtColor((preds_normal[0].detach().cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
-            cv2.imwrite(path_depth, (preds_depth[0].detach().cpu().numpy() * 255).astype(np.uint8))
+            # cv2.imwrite(path_depth, (preds_depth[0].detach().cpu().numpy() * 255).astype(np.uint8))
+
+            to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
+            # cv2.imwrite(path_depth, to8b(1 - np.array(preds_depth[0].cpu()) / np.max(np.array(preds_depth[0].cpu()))))
+            cv2.imwrite(path_depth, to8b(1 - (np.array(preds_depth[0].cpu()) / np.max(np.array(preds_depth[0].cpu())))))
 
             pbar.update(loader.batch_size)
 
@@ -635,7 +713,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss, psnr = self.train_step(data)
          
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -656,9 +734,9 @@ class Trainer(object):
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
 
                 if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss.item():.4f} ({total_loss/self.local_step:.4f}), s_val={self.model.forward_variance()[0,0].detach().cpu():.2f}, lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    pbar.set_description(f"psnr={psnr.item():.4f}, loss={loss.item():.4f} ({total_loss/self.local_step:.4f}), s_val={self.model.forward_variance()[0,0].detach().cpu():.2f}, lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
-                    pbar.set_description(f"loss={loss.item():.4f} ({total_loss/self.local_step:.4f}), s_val={self.model.forward_variance()[0,0].detach().cpu():.2f}, lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    pbar.set_description(f"psnr={psnr.item():.4f}, loss={loss.item():.4f} ({total_loss/self.local_step:.4f}), s_val={self.model.forward_variance()[0,0].detach().cpu():.2f}, lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 pbar.update(1)
 
         if self.ema is not None:
@@ -710,7 +788,7 @@ class Trainer(object):
 
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, preds_normal, preds_depth, truths, loss = self.eval_step(data)
+                preds, preds_normal, preds_depth, truths, loss, psnr = self.eval_step(data)
 
 
             # all_gather/reduce the statistics (NCCL only support all_*)
@@ -760,7 +838,7 @@ class Trainer(object):
                 cv2.imwrite(save_path_depth, (preds_depth[0].detach().cpu().numpy() * 255).astype(np.uint8))
                 cv2.imwrite(save_path_gt, cv2.cvtColor((truths[0].detach().cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
                 
-            pbar.set_description(f"loss={loss.item():.4f} ({total_loss/self.local_step:.4f})")
+            pbar.set_description(f"psnr={psnr.item():.4f}, loss={loss.item():.4f} ({total_loss/self.local_step:.4f})")
             pbar.update(loader.batch_size)
 
 

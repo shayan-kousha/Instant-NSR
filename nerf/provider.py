@@ -23,22 +23,44 @@ from .utils import get_rays
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
 def nerf_matrix_to_ngp(pose, aabb, bound):
 
-    scale = max(0.000001,max(max(abs(float(aabb[1][0])-float(aabb[0][0])),
-                                abs(float(aabb[1][1])-float(aabb[0][1]))),
-                                abs(float(aabb[1][2])-float(aabb[0][2]))))
-    scale =  2.0 * bound / scale
+    # scale = max(0.000001,max(max(abs(float(aabb[1][0])-float(aabb[0][0])),
+    #                             abs(float(aabb[1][1])-float(aabb[0][1]))),
+    #                             abs(float(aabb[1][2])-float(aabb[0][2]))))
+    # scale =  2.0 * bound / scale
 
-    offset = [((float(aabb[1][0]) + float(aabb[0][0])) * 0.5) * -scale,
-                ((float(aabb[1][1]) + float(aabb[0][1])) * 0.5) * -scale, 
-                ((float(aabb[1][2]) + float(aabb[0][2])) * 0.5) * -scale]
+    # offset = [((float(aabb[1][0]) + float(aabb[0][0])) * 0.5) * -scale,
+    #             ((float(aabb[1][1]) + float(aabb[0][1])) * 0.5) * -scale, 
+    #             ((float(aabb[1][2]) + float(aabb[0][2])) * 0.5) * -scale]
     
+    # new_pose = np.array([
+    #     [pose[1, 0], -pose[1, 1], -pose[1, 2], pose[1, 3] * scale + offset[1]],
+    #     [pose[2, 0], -pose[2, 1], -pose[2, 2], pose[2, 3] * scale + offset[2]],
+    #     [pose[0, 0], -pose[0, 1], -pose[0, 2], pose[0, 3] * scale + offset[0]],
+    #     [0, 0, 0, 1],
+    # ], dtype=pose.dtype)
+
+
+
+
+    scale = 2 / 3
     new_pose = np.array([
-        [pose[1, 0], -pose[1, 1], -pose[1, 2], pose[1, 3] * scale + offset[1]],
-        [pose[2, 0], -pose[2, 1], -pose[2, 2], pose[2, 3] * scale + offset[2]],
-        [pose[0, 0], -pose[0, 1], -pose[0, 2], pose[0, 3] * scale + offset[0]],
+        [pose[1, 0], -pose[1, 1], -pose[1, 2], pose[1, 3] * scale],
+        [pose[2, 0], -pose[2, 1], -pose[2, 2], pose[2, 3] * scale],
+        [pose[0, 0], -pose[0, 1], -pose[0, 2], pose[0, 3] * scale],
         [0, 0, 0, 1],
     ], dtype=pose.dtype)
+
+
+
+
+    # new_pose = np.array([
+    #     [pose[1, 0], -pose[1, 1], -pose[1, 2], pose[1, 3]],
+    #     [pose[2, 0], -pose[2, 1], -pose[2, 2], pose[2, 3]],
+    #     [pose[0, 0], -pose[0, 1], -pose[0, 2], pose[0, 3]],
+    #     [0, 0, 0, 1],
+    # ], dtype=pose.dtype)
     return new_pose
+    # return pose
 
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
@@ -136,6 +158,7 @@ class NeRFDataset(Dataset):
             slerp = Slerp([0, 1], rots)
 
             self.poses = []
+            self.images = []
             self.intrinsics = []
             try:
                 intrinsic = np.array(f0['K'], dtype=np.float32) # [4, 4]
@@ -143,12 +166,49 @@ class NeRFDataset(Dataset):
             except:
                 intrinsic = self.intrinsic
 
-            for i in range(n_test + 1):
-                ratio = np.sin(((i / n_test) - 0.5) * np.pi) * 0.5 + 0.5
-                pose = np.eye(4, dtype=np.float32)
-                pose[:3, :3] = slerp(ratio).as_matrix()
-                pose[:3, 3] = (1 - ratio) * pose0[:3, 3] + ratio * pose1[:3, 3]
+            # for i in range(n_test + 1):
+            #     ratio = np.sin(((i / n_test) - 0.5) * np.pi) * 0.5 + 0.5
+            #     pose = np.eye(4, dtype=np.float32)
+            #     pose[:3, :3] = slerp(ratio).as_matrix()
+            #     pose[:3, 3] = (1 - ratio) * pose0[:3, 3] + ratio * pose1[:3, 3]
+            #     self.poses.append(pose)
+            #     self.intrinsics.append(intrinsic)
+
+            frame = frames[:20]
+            for f in tqdm(frame, unit=" images", desc=f"Loading Images"):
+                f_path = os.path.join(self.root_path, f['file_path'])
+                if f_path[-4:] != '.png' and f_path[-4:] != '.jpg':
+                    f_path = f_path + '.png'
+
+                # there are non-exist paths in fox...
+                if not os.path.exists(f_path):
+                    continue
+
+                pose = nerf_matrix_to_ngp(np.array(f['transform_matrix'], dtype=np.float32), aabb=self.aabb, bound=bound) # [4, 4]
+                # pose = np.array(f['transform_matrix'], dtype=np.float32)
+
+                try:
+                    intrinsic = np.array(f['K'], dtype=np.float32) # [4, 4]
+                    intrinsic[:2, :] = intrinsic[:2, :] / downscale
+                except:
+                    intrinsic = self.intrinsic
+                
+                image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+
+                # add support for the alpha channel as a mask.
+                if image.shape[-1] == 3: 
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+                image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
+                image = image.astype(np.float32) / 255 # [H, W, 3/4]
+
                 self.poses.append(pose)
+                self.images.append(image)
+                self.intrinsics.append(intrinsic)
+
+                self.poses.append(pose)
+                self.images.append(image)
                 self.intrinsics.append(intrinsic)
 
             self.poses = np.stack(self.poses, axis=0).astype(np.float32)
@@ -167,6 +227,8 @@ class NeRFDataset(Dataset):
                 except:
                     intrinsic = self.intrinsic
 
+                
+
                 self.poses.append(pose)
                 self.intrinsics.append(intrinsic)
 
@@ -176,7 +238,7 @@ class NeRFDataset(Dataset):
         else:
             if type == 'train':
                 frame = frames[:]
-            elif type == 'valid':
+            elif type == 'val':
                 frame = frames[:1]
 
             self.poses = []
@@ -234,6 +296,10 @@ class NeRFDataset(Dataset):
             else:
                 self.poses = torch.from_numpy(self.poses).cuda()
                 self.intrinsics = torch.from_numpy(self.intrinsics).cuda()
+                if self.H is None:
+                    self.H = 800 // downscale
+                    self.W = 800 // downscale
+
 
     def __len__(self):
         return len(self.poses)
@@ -250,6 +316,7 @@ class NeRFDataset(Dataset):
             # only string can bypass the default collate, so we don't need to call item: https://github.com/pytorch/pytorch/blob/67a275c29338a6c6cc405bf143e63d53abe600bf/torch/utils/data/_utils/collate.py#L84
             results['H'] = str(self.H)
             results['W'] = str(self.W)
+            results['image'] = self.images[index]
             return results
         else:
             results['H'] = str(self.H)
