@@ -8,6 +8,9 @@ import numpy as np
 from encoding import get_encoder
 from .renderer_sdf import NeRFRenderer
 
+import tinycudann as tcnn
+from nerfacc import ContractionType, contract
+from nerfstudio.data.scene_box import SceneBox
 
 class NeRFNetwork(NeRFRenderer):
     def __init__(self,
@@ -72,12 +75,30 @@ class NeRFNetwork(NeRFRenderer):
                 sdf_net[l] = nn.utils.weight_norm(sdf_net[l])
 
         self.sdf_net = nn.ModuleList(sdf_net)
+        
+        # self.sdf_net = torch.load('sdf_net.pt')
+
+
+
+        # in_dim = self.in_dim + 3 if self.include_input else self.in_dim
+        # self.sdf_net = tcnn.Network(
+        #     n_input_dims=in_dim,
+        #     n_output_dims=1 + self.geo_feat_dim,
+        #     network_config={
+        #         "otype": "FullyFusedMLP",
+        #         "activation": "ReLU",
+        #         "output_activation": "None",
+        #         "n_neurons": hidden_dim,
+        #         "n_hidden_layers": num_layers - 1,
+        #     },
+        # )
 
         # color network
         self.num_layers_color = num_layers_color        
         self.hidden_dim_color = hidden_dim_color
         self.encoder_dir, self.in_dim_color = get_encoder(encoding_dir)
-        self.in_dim_color = self.in_dim_color + self.geo_feat_dim + 6 # hash_feat + dir + geo_feat + normal(sdf gradiant) 32 + 
+        # self.in_dim_color = self.in_dim_color + self.geo_feat_dim + 6 # hash_feat + dir + geo_feat + normal(sdf gradiant) 32 + 
+        self.in_dim_color = self.in_dim_color + self.geo_feat_dim # hash_feat + dir + geo_feat + normal(sdf gradiant) 32 +
 
         color_net =  []
         for l in range(num_layers_color):
@@ -97,6 +118,19 @@ class NeRFNetwork(NeRFRenderer):
                 color_net[l] = nn.utils.weight_norm(color_net[l])
 
         self.color_net = nn.ModuleList(color_net)
+        # self.color_net = torch.load('color_net.pt')
+
+        # self.color_net = tcnn.Network(
+        #     n_input_dims=self.in_dim_color,
+        #     n_output_dims=3,
+        #     network_config={
+        #         "otype": "FullyFusedMLP",
+        #         "activation": "ReLU",
+        #         "output_activation": "Sigmoid",
+        #         "n_neurons": self.hidden_dim_color,
+        #         "n_hidden_layers": num_layers_color - 1,
+        #     },
+        # )
         self.deviation_net = SingleVarianceNetwork(0.3)
 
         self.activation = nn.Softplus(beta=100)
@@ -133,10 +167,13 @@ class NeRFNetwork(NeRFRenderer):
 
         return sigma, color
 
-    def forward_sdf(self, x, bound):
+    def forward_sdf(self, x, aabb):
         # x: [B, N, 3], in [-bound, bound]
         # sdf
-        h = self.encoder(x, bound)
+        # h = self.encoder(x, bound)
+        # x = contract(x=x, roi=aabb, type=ContractionType.AABB) # when uncommenting this make sure normal calculation pass in aabb
+        # x.requires_grad = True
+        h = self.encoder(x)
 
         if self.include_input:
             h = torch.cat([x, h], dim=-1)
@@ -146,25 +183,31 @@ class NeRFNetwork(NeRFRenderer):
             if l != self.num_layers - 1:
                 h = self.activation(h)
                 #h = F.relu(h, inplace=True)
+
+        # h = self.sdf_net(h)
+
         sdf_output = h
 
-        return sdf_output
+        return sdf_output, x
     
     def forward_color(self, x, d, n, geo_feat, bound):
         # dir
         #d = (d + 1) / 2 # tcnn SH encoding requires inputs to be in [0, 1]
+        d = (d+1.)/2.
         d = self.encoder_dir(d)
 
         # color x, 
-        h = torch.cat([x, d, n, geo_feat], dim=-1)
+        # h = torch.cat([x, d, n, geo_feat], dim=-1)
+        h = torch.cat([d, geo_feat], dim=-1)
     
         for l in range(self.num_layers_color):
             h = self.color_net[l](h)
             if l != self.num_layers_color - 1:
                 h = F.relu(h, inplace=True)
-
         # sigmoid activation for rgb
         color = torch.sigmoid(h)
+
+        # color = self.color_net(h)
 
         return color
     
@@ -174,7 +217,10 @@ class NeRFNetwork(NeRFRenderer):
 
     def density(self, x, bound):
         # x: [B, N, 3], in [-bound, bound]
-        h = self.encoder(x, bound)
+        # h = self.encoder(x, bound)
+        aabb = SceneBox(torch.stack((torch.tensor([-1.0, -1.0, -1.0]), torch.tensor([1.0, 1.0, 1.0])))).aabb.reshape(2, 3).cuda()
+        # x = contract(x=x, roi=aabb, type=ContractionType.AABB)
+        h = self.encoder(x)
 
         if self.include_input:
             h = torch.cat([x, h], dim=-1)
@@ -183,6 +229,7 @@ class NeRFNetwork(NeRFRenderer):
             h = self.sdf_net[l](h)
             if l != self.num_layers - 1:
                 h = self.activation(h)
+        # h = self.sdf_net(h)
         sdf = h[..., 0]
         return sdf
 
@@ -193,27 +240,44 @@ class NeRFNetwork(NeRFRenderer):
     def finite_difference_normals_approximator(self, x, bound, epsilon = 0.0005):
         # finite difference
         # f(x+h, y, z), f(x, y+h, z), f(x, y, z+h) - f(x-h, y, z), f(x, y-h, z), f(x, y, z-h)
+        epsilon = 0.005
+
         pos_x = x + torch.tensor([[epsilon, 0.00, 0.00]], device=x.device)
-        dist_dx_pos = self.forward_sdf(pos_x.clamp(-bound, bound), bound)[:,:1]
+        dist_dx_pos = self.forward_sdf(pos_x.clamp(-bound, bound), bound)[0][:,:1]
         pos_y = x + torch.tensor([[0.00, epsilon, 0.00]], device=x.device)
-        dist_dy_pos = self.forward_sdf(pos_y.clamp(-bound, bound), bound)[:,:1]
+        dist_dy_pos = self.forward_sdf(pos_y.clamp(-bound, bound), bound)[0][:,:1]
         pos_z = x + torch.tensor([[0.00, 0.00, epsilon]], device=x.device)
-        dist_dz_pos = self.forward_sdf(pos_z.clamp(-bound, bound), bound)[:,:1]
+        dist_dz_pos = self.forward_sdf(pos_z.clamp(-bound, bound), bound)[0][:,:1]
 
         neg_x = x + torch.tensor([[-epsilon, 0.00, 0.00]], device=x.device)
-        dist_dx_neg = self.forward_sdf(neg_x.clamp(-bound, bound), bound)[:,:1]
+        dist_dx_neg = self.forward_sdf(neg_x.clamp(-bound, bound), bound)[0][:,:1]
         neg_y = x + torch.tensor([[0.00, -epsilon, 0.00]], device=x.device)
-        dist_dy_neg  = self.forward_sdf(neg_y.clamp(-bound, bound), bound)[:,:1]
+        dist_dy_neg  = self.forward_sdf(neg_y.clamp(-bound, bound), bound)[0][:,:1]
         neg_z = x + torch.tensor([[0.00, 0.00, -epsilon]], device=x.device)
-        dist_dz_neg  = self.forward_sdf(neg_z.clamp(-bound, bound), bound)[:,:1]
+        dist_dz_neg  = self.forward_sdf(neg_z.clamp(-bound, bound), bound)[0][:,:1]
 
         return torch.cat([0.5*(dist_dx_pos - dist_dx_neg) / epsilon, 0.5*(dist_dy_pos - dist_dy_neg) / epsilon, 0.5*(dist_dz_pos - dist_dz_neg) / epsilon], dim=-1)
 
 
-class SingleVarianceNetwork(nn.Module):
+class SingleVarianceNetworkOld(nn.Module):
     def __init__(self, init_val):
         super(SingleVarianceNetwork, self).__init__()
         self.register_parameter('variance', nn.Parameter(torch.tensor(init_val)))
 
     def forward(self, x):
         return torch.ones([len(x), 1], device=self.variance.device) * torch.exp(self.variance * 10.0)
+
+
+class SingleVarianceNetwork(nn.Module):
+    def __init__(self, init_val):
+        super(SingleVarianceNetwork, self).__init__()
+        self.init_val = 0.3
+        self.register_parameter("variance", nn.Parameter(torch.tensor(self.init_val)))
+
+    def inv_s(self):
+        # print(self.variance)
+        val = torch.exp(self.variance * 10.0)
+        return val
+
+    def forward(self, x):
+        return torch.ones([len(x), 1], device=self.variance.device) * self.inv_s()
